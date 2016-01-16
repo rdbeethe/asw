@@ -46,6 +46,11 @@ __global__ void gpu_memset(unsigned char* start, unsigned char value, int length
 	}
 }
 
+// teeny little helper function
+void gpu_perror(char* input){
+	printf("%s: %s\n", input, cudaGetErrorString(cudaGetLastError()));
+}
+
 // Here's the plan!
 // I need to program the kernel to work with a no-boundaries condition
 // Then I can modify it to deal with weird boundaries or large disparities
@@ -67,6 +72,9 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	// shared memory will contain all the input image data for the full block of asw calculations
 	// texture memory will contain the spacial filter, eventually
 	extern __shared__ unsigned char im[]; // contains both left and right image data
+
+	// pretend that debug is a float*
+	float* fdebug = (float*)debug;
 
 	// get the size of the sub-images that we are considering
 	// reference window
@@ -126,7 +134,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 					// copy bytes (not pixels) from global_left into reference image
 					ref[y_idx*ref_width_bytes + x_idx] = global_left[g_y_idx*ncols*nchans + g_x_idx];
 					// copy into the debug image (only made to work with a single block of threads)
-					// debug[g_y_idx*ncols*nchans + g_x_idx]  = ref[y_idx*ref_width_bytes + x_idx];
+					debug[g_y_idx*ncols*nchans + g_x_idx]  = ref[y_idx*ref_width_bytes + x_idx];
 				}
 			}
 		}
@@ -147,7 +155,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 					// copy bytes (not pixels) from global_left into reference image
 					tgt[y_idx*tgt_width_bytes + x_idx] = global_right[g_y_idx*ncols*nchans + g_x_idx];
 					// copy into the debug image (only made to work with a single block of threads)
-					debug[g_y_idx*ncols*nchans + g_x_idx]  = tgt[y_idx*tgt_width_bytes + x_idx];
+					// debug[g_y_idx*ncols*nchans + g_x_idx]  = tgt[y_idx*tgt_width_bytes + x_idx];
 				}
 			}
 		}
@@ -156,7 +164,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	__syncthreads();
 
 	// initialize weights and costs
-	for(int i = 0; i < MAX_DISP; i++){
+	for(int i = 0; i < ndisp; i++){
 		costs[i] = 0;
 		weights[i] = 0;
 	}
@@ -219,6 +227,11 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				costs[disp] += weight*ref2tgt_diff;
 				// add in the weight
 				weights[disp] += weight;
+				// reading this output forces things to compile
+				fdebug[disp] += ref2tgt_diff;
+				fdebug[disp+ndisp] += weight;
+				fdebug[disp+2*ndisp] += tgt_pix[0];
+				fdebug[disp+3*ndisp] += ref_pix[0];
 			}
 		}
 	}
@@ -226,8 +239,8 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	__syncthreads();
 
 	// now go through and find the lowest normalized cost
+	unsigned char index = 0;
 	float min_cost = costs[0]/weights[0];
-	int index = 0;
 	for(int disp = 1; disp < ndisp; disp++){
 		cost = costs[disp]/weights[disp];	
 		if(cost < min_cost){
@@ -236,13 +249,40 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 		}
 		__syncthreads();
 	}
+
+	// retrying, but without ever dividing by zero
+	// float min_cost = 10;
+	// for(int disp = 0; disp < ndisp; disp++){
+	// 	if(weights[disp] > 0){
+	// 		cost = costs[disp]/weights[disp];
+	// 		if(cost < min_cost){
+	// 			min_cost = cost;
+	// 			index = (unsigned char)disp;
+	// 		}
+	// 	}
+	// 	// __syncthreads();
+	// }
+
 	// set the output to the index of min_cost
 	output[gy*ncols + gx] = index;
+
+	float cvalue = 1;
+	float wvalue = 1;
+	for(int i = 0; i < ndisp; i++){
+		wvalue = min(wvalue,weights[i]);
+		cvalue = min(cvalue,costs[i]);
+	}
+	if(wvalue == 0){
+		output[gy*ncols + gx + blockDim.x] = 255;
+	}
+	if(cvalue == 0){
+		output[gy*ncols + gx - blockDim.x] = 255;
+	}
 }
 
 int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 	// window size and win_rad
-	int win_size = 3*s_sigma-1;
+	int win_size = 3*s_sigma;
 	int win_rad = (win_size - 1)/2;
 	// declare timer
 	struct timespec timer;
@@ -314,7 +354,9 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 	int bpg = nrows*ncols*sizeof(unsigned char) / tpb + 1;
 	printf("zeroing output images\n");
 	gpu_memset<<<bpg, tpb>>>(d_out,25,nrows*ncols*sizeof(unsigned char));
+	gpu_perror("memset1");
 	gpu_memset<<<nchans*bpg, tpb>>>(d_debug,25,nchans*nrows*ncols*sizeof(unsigned char));
+	gpu_perror("memset2");
 
 	// call the kernel here!
 	dim3 blocksPerGrid(1,1);
@@ -322,8 +364,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 	size_t reference_window_size = (2*win_rad+BLOCK_SIZE)*(2*win_rad+BLOCK_SIZE)*sizeof(unsigned char)*nchans;
 	size_t target_window_size = (2*win_rad+ndisp+BLOCK_SIZE)*(BLOCK_SIZE+2*win_rad)*sizeof(unsigned char)*nchans;
 	size_t shared_size = target_window_size+reference_window_size;
+	printf("win_size %d win_rad %d ndisp %d shared size = %d\n",win_size,win_rad,ndisp,shared_size);
 	if(shared_size > 47000){
-		printf("shared size = %d\n",shared_size);
 		printf("FATAL ERROR: shared_size for asw_kernel exceeds the device limit (48 kB), exiting\n");
 		return 1;
 	}
@@ -334,16 +376,31 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     asw_kernel<<<blocksPerGrid, threadsPerBlock, shared_size>>>(d_im_l, d_im_r, d_out, d_debug,
     	nrows, ncols, nchans, ndisp, win_size, win_rad, s_sigma, c_sigma);
     check_timer("asw kernel finished",&timer);
+	gpu_perror("asw_kernel");
 
 	// copy the device output data to the host
     cudaMemcpy(out, d_out, nrows*ncols*sizeof(unsigned char), cudaMemcpyDeviceToHost);
     cudaMemcpy(debug, d_debug, nrows*ncols*nchans*sizeof(unsigned char), cudaMemcpyDeviceToHost);
+
+    printf("raw costs: ");
+    for(int i = 0; i < ndisp; i++){
+    	printf("%f ",((float*)debug)[i]);
+    }
+    printf("\n");
+
+    printf("weights: ");
+    for(int i = 0; i < ndisp; i++){
+    	printf("%f ",((float*)debug)[i+ndisp]);
+    }
+    printf("\n");
 
     // make an image and view it:
     cv::Mat im_out(nrows,ncols,CV_8UC1,out);
     cv::Mat im_debug(nrows,ncols,CV_8UC3,debug);
     cv::rectangle(im_debug,cv::Point(16*15,16*15),cv::Point(16*16,16*16),cv::Scalar(255,0,0));
     cv::rectangle(im_out,cv::Point(16*15,16*15),cv::Point(16*16,16*16),127);
+    cv::imshow("window",im_debug);
+    cv::waitKey(0);
     cv::imshow("window",im_out);
     cv::waitKey(0);
 
