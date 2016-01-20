@@ -120,6 +120,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	int yblocks = ref_rows / blockDim.y + 1;
 	int xstart = (bx*blockDim.x - win_rad)*nchans;
 	int ystart = gy - win_rad;
+	// 29 variables here
 	for(int i = 0; i < xblocks; i++){
 		int x_idx = i*blockDim.x + tx;
 		int g_x_idx = xstart + i*blockDim.x + tx;
@@ -188,12 +189,12 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				ref_c2p_diff += abs(ref_center_pix[i] - ref_pix[i]);
 			}
 			// get the ref_c_factor
-			ref_c_factor = pow(2.71828,-ref_c2p_diff*ref_c2p_diff/(2.*c_sigma*c_sigma));
+			ref_c_factor = __expf(-ref_c2p_diff*ref_c2p_diff/(2.*c_sigma*c_sigma));
 			// find the window-center to pixel y-distance
 			int dy = win_y - win_rad;
 			float radius_2 = dx*dx + dy*dy;
 			// get the s_factor for this particular window location
-			s_factor = pow(2.71828,-radius_2/(2.*s_sigma*s_sigma));
+			s_factor = __expf(-radius_2/(2.*s_sigma*s_sigma));
 			// for each value of ndisp:
 			for(int disp = 0; disp < ndisp; disp++){
 				// get a pointer to the tgt_center_pix, which changes for each disp
@@ -210,7 +211,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 					tgt_c2p_diff += abs(tgt_center_pix[i] - ref_pix[i]);
 				}
 				// get the tgt_c_factor
-				tgt_c_factor = pow(2.71828,-tgt_c2p_diff*tgt_c2p_diff/(2.*c_sigma*c_sigma));
+				tgt_c_factor = __expf(-tgt_c2p_diff*tgt_c2p_diff/(2.*c_sigma*c_sigma));
 				// get the ref2tgt_diff
 				float ref2tgt_diff = abs(ref_pix[0] - tgt_pix[0]);
 				// include additional channels
@@ -361,8 +362,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     // cv::rectangle(im_out,cv::Point(16*15,16*15),cv::Point(16*16,16*16),127);
     // cv::imshow("window",im_debug);
     // cv::waitKey(0);
-    cv::imshow("window",im_out);
-    cv::waitKey(0);
+    // cv::imshow("window",im_out);
+    // cv::waitKey(0);
 
 	// cleanup memory
 	cudaFree(d_im_l);
