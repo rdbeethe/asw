@@ -89,10 +89,11 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	float ref_c_factor;  // this will have to be recalculated every time
 	float tgt_c_factor;  // this will have to be recalculated every time
 	float s_factor; // I think I can calculate this each time for now
+	// variables for keeping track of the output
 	float weight;
-	float weights[MAX_DISP];
 	float cost;
-	float costs[MAX_DISP];
+	float min_cost;
+	unsigned char min_cost_index;
 	unsigned char* ref_center_pix;
 	unsigned char* ref_pix;
 	unsigned char* tgt_center_pix;
@@ -161,49 +162,49 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 
 	__syncthreads();
 
-	// initialize weights and costs
-	for(int i = 0; i < ndisp; i++){
-		costs[i] = 0;
-		weights[i] = 0;
-	}
-
 	// get a pointer to the ref_center_pix, which is constant for any given thread
 	ref_center_pix = &ref[(win_rad + ty)*ref_width_bytes + (win_rad + tx)*nchans];
+	// initialize min_cost to some arbitrarily large value
+	min_cost = 1e12;
+	// initialize min_cost_index to 0
+	min_cost_index = 0;
 
-	// in each row in the window:
-	for(int win_x = 0; win_x < win_size; win_x++){
-		// locate the pixel in the ref image
-		int ref_x = win_x + tx;
-		// find the window-center to pixel x-distance
-		int dx = win_x - win_rad;
-		// in each column of the window:
-		for(int win_y = 0; win_y < win_size; win_y++){
+	// for each value of ndisp	
+	for(int disp = 0; disp < ndisp; disp++){
+		// get a pointer to the tgt_center_pix, which is constant for each disp
+		tgt_center_pix = &tgt[(win_rad + ty)*tgt_width_bytes + (ndisp + win_rad + tx - disp)*nchans];
+		// reset weight and cost
+		weight = 0;
+		cost = 0;
+		// in each row in the window:
+		for(int win_x = 0; win_x < win_size; win_x++){
 			// locate the pixel in the ref image
-			int ref_y = win_y + ty;
-			// get a pointer to the pixel
-			ref_pix = &ref[ref_y*ref_width_bytes + ref_x*nchans];
-			// get the ref center-to-pixel color difference
-			float ref_c2p_diff = abs(ref_center_pix[0] - ref_pix[0]);
-			// include additional channels
-			for(int i = 1; i < nchans; i++){
-				ref_c2p_diff += abs(ref_center_pix[i] - ref_pix[i]);
-			}
-			// get the ref_c_factor
-			ref_c_factor = __expf(-ref_c2p_diff*ref_c2p_diff/(2.*c_sigma*c_sigma));
-			// find the window-center to pixel y-distance
-			int dy = win_y - win_rad;
-			float radius_2 = dx*dx + dy*dy;
-			// get the s_factor for this particular window location
-			s_factor = __expf(-radius_2/(2.*s_sigma*s_sigma));
-			// for each value of ndisp:
-			for(int disp = 0; disp < ndisp; disp++){
-				// get a pointer to the tgt_center_pix, which changes for each disp
-				tgt_center_pix = &tgt[(win_rad + ty)*tgt_width_bytes + (ndisp + win_rad + tx - disp)*nchans];
-				// locate the pixel in the tgt image
-				int tgt_x = ndisp + win_x + tx - disp;
-				int tgt_y = ref_y;
-				// get a pointer to the pixel
-				tgt_pix = &tgt[tgt_y*tgt_width_bytes + tgt_x*nchans];
+			int ref_x = win_x + tx;
+			// locate the pixel in the tgt image
+			int tgt_x = ndisp + win_x + tx - disp;
+			// find the window-center to pixel x-distance
+			int dx = win_x - win_rad;
+			// in each column of the window:
+			for(int win_y = 0; win_y < win_size; win_y++){
+				// locate the pixel in the ref image
+				int ref_y = win_y + ty;
+				// find the window-center to pixel y-distance
+				int dy = win_y - win_rad;
+				// get the radius^2 value
+				float radius_2 = dx*dx + dy*dy;
+				// get the s_factor for this particular window location
+				s_factor = __expf(-radius_2/(2.*s_sigma*s_sigma));
+				// get a pointer to the tgt and ref pixels
+				ref_pix = &ref[ref_y*ref_width_bytes + ref_x*nchans];
+				tgt_pix = &tgt[ref_y*tgt_width_bytes + tgt_x*nchans];
+				// get the ref center-to-pixel color difference
+				float ref_c2p_diff = abs(ref_center_pix[0] - ref_pix[0]);
+				// include additional channels
+				for(int i = 1; i < nchans; i++){
+					ref_c2p_diff += abs(ref_center_pix[i] - ref_pix[i]);
+				}
+				// get the ref_c_factor
+				ref_c_factor = __expf(-ref_c2p_diff*ref_c2p_diff/(2.*c_sigma*c_sigma));
 				// get the tgt center-to-pixel color difference
 				float tgt_c2p_diff = abs(tgt_center_pix[0] - ref_pix[0]);
 				// include additional channels
@@ -219,33 +220,24 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 					ref2tgt_diff+= abs(ref_pix[i] - tgt_pix[i]);
 					ref2tgt_diff+= abs(ref_pix[i] - tgt_pix[i]);
 				}
-				//calulate the weight
-				weight = s_factor*ref_c_factor*tgt_c_factor;
+				// calulate the pix_weight (this variable has been done away with to increase ILP)
+				// pix_weight = s_factor*ref_c_factor*tgt_c_factor;
 				// add in the cost
-				costs[disp] += weight*ref2tgt_diff;
+				cost += s_factor*ref_c_factor*tgt_c_factor*ref2tgt_diff;
 				// add in the weight
-				weights[disp] += weight;
-				// reading this output forces things to compile
+				weight += s_factor*ref_c_factor*tgt_c_factor;
 			}
 		}
-	}
-
-	__syncthreads();
-
-	// now go through and find the lowest normalized cost
-	unsigned char index = 0;
-	float min_cost = costs[0]/weights[0];
-	for(int disp = 1; disp < ndisp; disp++){
-		cost = costs[disp]/weights[disp];	
-		if(cost < min_cost){
-			min_cost = cost;
-			index = disp;
+		// now that the window is done, compare this cost (after normalizing) to min_cost
+		if( min_cost > cost / weight){
+			min_cost = cost / weight;
+			min_cost_index = disp;
 		}
 		__syncthreads();
 	}
 
 	// set the output to the index of min_cost
-	output[gy*ncols + gx] = index;
+	output[gy*ncols + gx] = min_cost_index;
 }
 
 int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
@@ -362,8 +354,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     // cv::rectangle(im_out,cv::Point(16*15,16*15),cv::Point(16*16,16*16),127);
     // cv::imshow("window",im_debug);
     // cv::waitKey(0);
-    // cv::imshow("window",im_out);
-    // cv::waitKey(0);
+    cv::imshow("window",im_out);
+    cv::waitKey(0);
 
 	// cleanup memory
 	cudaFree(d_im_l);
