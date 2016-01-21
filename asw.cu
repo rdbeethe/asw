@@ -6,13 +6,12 @@
 #include <inttypes.h>
 
 
-#define MAX_BLOCK_SIZE 32
-#define MAX_WINDOW_SIZE 55
 #define MAX_DISP 1000
-
 #define NCHANS 3
+#define IDP_LVL 4
 
 #define BLOCK_SIZE 16
+
 
 // timing utility
 struct timespec check_timer(const char* str, struct timespec* ts){
@@ -51,12 +50,6 @@ __global__ void gpu_memset(unsigned char* start, unsigned char value, int length
 // teeny little helper function
 void gpu_perror(char* input){
 	printf("%s: %s\n", input, cudaGetErrorString(cudaGetLastError()));
-}
-
-// Here's the plan!
-// I need to program the kernel to work with a no-boundaries condition
-// Then I can modify it to deal with weird boundaries or large disparities
-// And also it will need to have a check for very large 
 
 
 // In the future it may be useful to bring a whole line of pixels into local memory...
@@ -64,9 +57,33 @@ void gpu_perror(char* input){
 // ... for a given pixel, before moving to the next row...
 // ... or maybe it would be better to use a single location of spacial sigma.  Oh I like that. 
 
+
+// now let's try just running with 32 threads, but each 32 thread warp stretches horizontally across a row
+__global__ void asw_kernel2(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
+	int nrows, int ncols, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
+{
+	// now that we are just doing a line at a time, we don't really need dynamic allocations
+	__shared__ unsigned char ref[(win_size + blockDim.x)*NCHANS*IDP_LVL];
+	__shared__ unsigned char tgt[(win_size + blockDim.x + MAX_DISP)*NCHANS*IDP_LVL];
+	// if we start somewhere with a middle row of the image, then we can use a shared variable to share center values
+	__shared__ unsigned char ref_center_pix[NCHANS*IDP_LVL];
+	__shared__ unsigned char tgt_center_pix[MAX_DISP*NCHANS*IDP_LVL]
+
+	int ref_width_bytes = (2*win_rad+blockDim.x)*NCHANS*sizeof(unsigned char);
+	int tgt_width_bytes = (ndisp+2*win_rad+blockDim.x)*NCHANS*sizeof(unsigned char);
+
+	// we are sticking with local memory for the sums of the disparities, because since we only access that occasionally I don't think the latency is a problem
+	float costs[MAX_DISP*IDP_LVL];
+	float weights[MAX_DISP*IDP_LVL];
+
+	// other things should fall into register memory
+
+
+}
+
 // Device code
 __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
-	int nrows, int ncols, int nchans, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
+	int nrows, int ncols, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
 	{
 	// ok, we're going to try a block size of 32 ( 32x32 = 1024, max threads per block )
 	// no... we'll use 16x16 since there's problems with shared memory with two images
