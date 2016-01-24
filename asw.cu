@@ -50,6 +50,7 @@ __global__ void gpu_memset(unsigned char* start, unsigned char value, int length
 // teeny little helper function
 void gpu_perror(char* input){
 	printf("%s: %s\n", input, cudaGetErrorString(cudaGetLastError()));
+}
 
 
 // In the future it may be useful to bring a whole line of pixels into local memory...
@@ -59,15 +60,29 @@ void gpu_perror(char* input){
 
 
 // now let's try just running with 32 threads, but each 32 thread warp stretches horizontally across a row
+// we want to reduced shared memory accesses and increase IDP, so with this in mind we will...
+// ... read in an entire line (blockdim.x + 2*win_rad + ndisp) into shared memory
+// ... ok hold on...
+// ... first strategy: horizontal line of threads, each thread calculates n pixels below it as well
+// ... second strategy: vertical line of threads, each thread calculates n pixels to the right of it
+// ... the first strategy is good for IDP, and can reduce shared reads because each pixel below needs
+// ... to access a given pixel once for each ndisp (in general)
+// ... second strategy is good because each thread needs to access each pixel for differenct ndisp
+// ... the IDP-vertically strategy has neater boundary conditions in the disp direction, because all IDPs share same disp
+// ... the IDP-horizontally strategy has neater boundary conditions in the window direction because all IDPs share same 
+// ... but in either case I think the GPU usage should be the same since every thread should run into the same problems.
+// ... therefore I don't think that should be a deciding factor.
+// My next concern is that we will not generate enough blocks with this strategy to fill a large GPU
+// ... obviously that's a problem with the old kernel writeup as well.
+// I guess for now we will just work on minimizing shared memory accessess.
 __global__ void asw_kernel2(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
 	int nrows, int ncols, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
 {
-	// now that we are just doing a line at a time, we don't really need dynamic allocations
-	__shared__ unsigned char ref[(win_size + blockDim.x)*NCHANS*IDP_LVL];
-	__shared__ unsigned char tgt[(win_size + blockDim.x + MAX_DISP)*NCHANS*IDP_LVL];
+	extern __shared__ unsigned char ref[]; // the beginning of the shared memory block
+	unsigned char* tgt = &ref[(win_size + blockDim.x)*NCHANS*IDP_LVL]; // tgt follows a block big enough for reference
 	// if we start somewhere with a middle row of the image, then we can use a shared variable to share center values
-	__shared__ unsigned char ref_center_pix[NCHANS*IDP_LVL];
-	__shared__ unsigned char tgt_center_pix[MAX_DISP*NCHANS*IDP_LVL]
+	// __shared__ unsigned char ref_center_pix[NCHANS*IDP_LVL];
+	// __shared__ unsigned char tgt_center_pix[MAX_DISP*NCHANS*IDP_LVL]
 
 	int ref_width_bytes = (2*win_rad+blockDim.x)*NCHANS*sizeof(unsigned char);
 	int tgt_width_bytes = (ndisp+2*win_rad+blockDim.x)*NCHANS*sizeof(unsigned char);
@@ -132,8 +147,6 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	#define by (blockIdx.y + 1)
 	#define gx (bx*blockDim.x + tx)
 	#define gy (by*blockDim.y + ty)
-
-	// setup LUTs // nevermind... right now there are none
 
 	// copy relevant subimages to shared memory
 	// TODO: additional boundary checks on this data
@@ -356,11 +369,11 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 	dim3 blocksPerGrid(22,21);
 	dim3 threadsPerBlock(BLOCK_SIZE,BLOCK_SIZE);
 	// __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
-	//		int nrows, int ncols, int nchans, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
+	//		int nrows, int ncols, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
 	printf("starting asw kernel\n");
 	check_timer(NULL,&timer);
     asw_kernel<<<blocksPerGrid, threadsPerBlock, shared_size>>>(d_im_l, d_im_r, d_out, d_debug,
-    	nrows, ncols, nchans, ndisp, win_size, win_rad, s_sigma, c_sigma);
+    	nrows, ncols, nchans, win_size, win_rad, s_sigma, c_sigma);
     cudaDeviceSynchronize();
     check_timer("asw kernel finished",&timer);
 	gpu_perror("asw_kernel");
