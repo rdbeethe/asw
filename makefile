@@ -1,5 +1,5 @@
 all:
-	nvcc asw.cu
+	nvcc `pkg-config opencv --cflags` asw.cu `pkg-config opencv --libs`
 
 run:
-	optirun ./a.out
+	optirun ./a.out l.png r.png 64 5 50
