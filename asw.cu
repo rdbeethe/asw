@@ -73,20 +73,20 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	// each thread will calculate the full asw stereo output for a single pixel
 	// shared memory will contain all the input image data for the full block of asw calculations
 	// texture memory will contain the spacial filter, eventually
-	extern __shared__ unsigned char im[]; // contains both left and right image data
+	extern __shared__ float im[]; // contains both left and right image data
 
 	// get the size of the sub-images that we are considering
 	// reference window
 	int ref_width_pix = 2*win_rad+blockDim.x;
-	int ref_width_bytes = ref_width_pix*NCHANS*sizeof(unsigned char);
+	// int ref_width_bytes = ref_width_pix*NCHANS;
 	int ref_rows = 2*win_rad+blockDim.y;
 	// target window
 	int tgt_width_pix = ndisp+2*win_rad+blockDim.x;
-	int tgt_width_bytes = tgt_width_pix*NCHANS*sizeof(unsigned char);
+	// int tgt_width_bytes = tgt_width_pix*NCHANS;
 	int tgt_rows = 2*win_rad+blockDim.y;
 
-	unsigned char* ref = im; // left image, reference to the beginnning of im[]
-	unsigned char* tgt = (unsigned char*)(&im[ ref_width_bytes*ref_rows ]); // right image, reference to somwhere in middle of im[]
+	float* ref = im; // left image, reference to the beginnning of im[]
+	float* tgt = (float*)(&im[ ref_width_pix*NCHANS*ref_rows ]); // right image, reference to somwhere in middle of im[]
 
 	float ref_c_factor;  // this will have to be recalculated every time
 	float tgt_c_factor;  // this will have to be recalculated every time
@@ -95,11 +95,11 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	float weight;
 	float cost;
 	float min_cost;
-	unsigned char min_cost_index;
-	unsigned char* ref_center_pix;
-	unsigned char* tgt_center_pix;
-	unsigned char ref_pix[3];
-	unsigned char tgt_pix[3];
+	int min_cost_index;
+	float* ref_center_pix;
+	float* tgt_center_pix;
+	float ref_pix[3];
+	float tgt_pix[3];
 
 	// get identity of this thread
 	int tx = threadIdx.x;
@@ -119,7 +119,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	// except then I don't know how to deal with the edge case
 	// so let's just do one character at a time
 	// starting with reference image:
-	int xblocks = ref_width_bytes / blockDim.x + 1;
+	int xblocks = ref_width_pix*NCHANS / blockDim.x + 1;
 	int yblocks = ref_rows / blockDim.y + 1;
 	int xstart = (bx*blockDim.x - win_rad)*NCHANS;
 	int ystart = gy - win_rad;
@@ -127,36 +127,36 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	for(int i = 0; i < xblocks; i++){
 		int x_idx = i*blockDim.x + tx;
 		int g_x_idx = xstart + i*blockDim.x + tx;
-		if(x_idx < ref_width_bytes){
+		if(x_idx < ref_width_pix*NCHANS){
 			for(int j = 0; j < yblocks; j++){
 				int y_idx = j*blockDim.y + ty;
 				int g_y_idx = ystart + j*blockDim.y;
 				if(y_idx < ref_rows){
 					// copy bytes (not pixels) from global_left into reference image
-					ref[y_idx*ref_width_bytes + x_idx] = global_left[g_y_idx*ncols*NCHANS + g_x_idx];
+					ref[y_idx*ref_width_pix*NCHANS + x_idx] = global_left[g_y_idx*ncols*NCHANS + g_x_idx];
 					// copy into the debug image (only made to work with a single block of threads)
-					// debug[g_y_idx*ncols*NCHANS + g_x_idx]  = ref[y_idx*ref_width_bytes + x_idx];
+					// debug[g_y_idx*ncols*NCHANS + g_x_idx]  = ref[y_idx*ref_width_pix*NCHANS + x_idx];
 				}
 			}
 		}
 	}
 	// then to the target image:
-	xblocks = tgt_width_bytes / blockDim.x + 1;
+	xblocks = tgt_width_pix*NCHANS / blockDim.x + 1;
 	yblocks = tgt_rows / blockDim.y + 1;
 	xstart = (bx*blockDim.x - win_rad - ndisp)*NCHANS;
 	ystart = gy - win_rad;
 	for(int i = 0; i < xblocks; i++){
 		int x_idx = i*blockDim.x + tx;
 		int g_x_idx = xstart + i*blockDim.x + tx;
-		if(x_idx < tgt_width_bytes){
+		if(x_idx < tgt_width_pix*NCHANS){
 			for(int j = 0; j < yblocks; j++){
 				int y_idx = j*blockDim.y + ty;
 				int g_y_idx = ystart + j*blockDim.y;
 				if(y_idx < tgt_rows){
 					// copy bytes (not pixels) from global_left into reference image
-					tgt[y_idx*tgt_width_bytes + x_idx] = global_right[g_y_idx*ncols*NCHANS + g_x_idx];
+					tgt[y_idx*tgt_width_pix*NCHANS + x_idx] = global_right[g_y_idx*ncols*NCHANS + g_x_idx];
 					// copy into the debug image (only made to work with a single block of threads)
-					// debug[g_y_idx*ncols*NCHANS + g_x_idx]  = tgt[y_idx*tgt_width_bytes + x_idx];
+					// debug[g_y_idx*ncols*NCHANS + g_x_idx]  = tgt[y_idx*tgt_width_pix*NCHANS + x_idx];
 				}
 			}
 		}
@@ -165,7 +165,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	__syncthreads();
 
 	// get a pointer to the ref_center_pix, which is constant for any given thread
-	ref_center_pix = &ref[(win_rad + ty)*ref_width_bytes + (win_rad + tx)*NCHANS];
+	ref_center_pix = &ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS];
 	// initialize min_cost to some arbitrarily large value
 	min_cost = 1e12;
 	// initialize min_cost_index to 0
@@ -174,16 +174,16 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	// for each value of ndisp	
 	for(int disp = 0; disp < ndisp; disp++){
 		// get a pointer to the tgt_center_pix, which is constant for each disp
-		tgt_center_pix = &tgt[(win_rad + ty)*tgt_width_bytes + (ndisp + win_rad + tx - disp)*NCHANS];
+		tgt_center_pix = &tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS];
 		// reset weight and cost
 		weight = 0;
 		cost = 0;
 		// in each row in the window:
 		for(int win_x = 0; win_x < win_size; win_x++){
 			// locate the pixel in the ref image (deleted this var)
-			int dx = win_x + tx;
+			// int dx = win_x + tx;
 			// locate the pixel in the tgt image (deleted this var)
-			int tgt_x = ndisp + win_x + tx - disp;
+			// int tgt_x = ndisp + win_x + tx - disp;
 			// find the window-center to pixel x-distance (deleted this var)
 			// int dx = win_x - win_rad;
 			// in each column of the window:
@@ -197,12 +197,12 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				// get the s_factor for this particular window location
 				s_factor = __expf(-((win_x-win_rad)*(win_x-win_rad) + (win_y-win_rad)*(win_y-win_rad))/(2.*s_sigma*s_sigma));
 				// store tgt and ref pixels in register memory
-				ref_pix[0] = ref[(win_y+ty)*ref_width_bytes + (win_x+tx)*NCHANS + 0];
-				ref_pix[1] = ref[(win_y+ty)*ref_width_bytes + (win_x+tx)*NCHANS + 1];
-				ref_pix[2] = ref[(win_y+ty)*ref_width_bytes + (win_x+tx)*NCHANS + 2];
-				tgt_pix[0] = tgt[(win_y+ty)*tgt_width_bytes + (ndisp+win_x+tx-disp)*NCHANS + 0];
-				tgt_pix[1] = tgt[(win_y+ty)*tgt_width_bytes + (ndisp+win_x+tx-disp)*NCHANS + 1];
-				tgt_pix[2] = tgt[(win_y+ty)*tgt_width_bytes + (ndisp+win_x+tx-disp)*NCHANS + 2];
+				ref_pix[0] = ref[(win_y+ty)*ref_width_pix*NCHANS + (win_x+tx)*NCHANS + 0];
+				ref_pix[1] = ref[(win_y+ty)*ref_width_pix*NCHANS + (win_x+tx)*NCHANS + 1];
+				ref_pix[2] = ref[(win_y+ty)*ref_width_pix*NCHANS + (win_x+tx)*NCHANS + 2];
+				tgt_pix[0] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 0];
+				tgt_pix[1] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 1];
+				tgt_pix[2] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 2];
 				// get the center-to-pixel and overall color differences (organized together for IDP)
 				float ref_c2p_diff = abs(ref_center_pix[0] - ref_pix[0]);
 				float tgt_c2p_diff = abs(tgt_center_pix[0] - ref_pix[0]);
@@ -319,8 +319,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 	gpu_perror("memset2");
 
 	// check some values before calling the asw_kernel
-	size_t reference_window_size = (2*win_rad+BLOCK_SIZE)*(2*win_rad+BLOCK_SIZE)*sizeof(unsigned char)*nchans;
-	size_t target_window_size = (2*win_rad+ndisp+BLOCK_SIZE)*(BLOCK_SIZE+2*win_rad)*sizeof(unsigned char)*nchans;
+	size_t reference_window_size = (2*win_rad+BLOCK_SIZE)*(2*win_rad+BLOCK_SIZE)*sizeof(float)*nchans;
+	size_t target_window_size = (2*win_rad+ndisp+BLOCK_SIZE)*(BLOCK_SIZE+2*win_rad)*sizeof(float)*nchans;
 	size_t shared_size = target_window_size+reference_window_size;
 	printf("win_size %d win_rad %d ndisp %d shared size = %d\n",win_size,win_rad,ndisp,shared_size);
 	if(shared_size > 47000){
@@ -328,18 +328,20 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 		return 1;
 	}
 
-	// call the asw_kernel
-	dim3 blocksPerGrid(22,21);
-	dim3 threadsPerBlock(BLOCK_SIZE,BLOCK_SIZE);
-	// __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
-	//		int nrows, int ncols, int nchans, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
-	printf("starting asw kernel\n");
-	check_timer(NULL,&timer);
-    asw_kernel<<<blocksPerGrid, threadsPerBlock, shared_size>>>(d_im_l, d_im_r, d_out, d_debug,
-    	nrows, ncols, nchans, ndisp, win_size, win_rad, s_sigma, c_sigma);
-    cudaDeviceSynchronize();
-    check_timer("asw kernel finished",&timer);
-	gpu_perror("asw_kernel");
+	{
+		// call the asw_kernel
+		dim3 blocksPerGrid(22,21);
+		dim3 threadsPerBlock(BLOCK_SIZE,BLOCK_SIZE);
+		// __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
+		//		int nrows, int ncols, int nchans, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
+		printf("starting asw kernel\n");
+		check_timer(NULL,&timer);
+	    asw_kernel<<<blocksPerGrid, threadsPerBlock, shared_size>>>(d_im_l, d_im_r, d_out, d_debug,
+	    	nrows, ncols, nchans, ndisp, win_size, win_rad, s_sigma, c_sigma);
+	    cudaDeviceSynchronize();
+	    check_timer("asw kernel finished",&timer);
+		gpu_perror("asw_kernel");
+	}
 
 	// copy the device output data to the host
 	check_timer(NULL,&timer);
@@ -354,8 +356,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     // cv::rectangle(im_out,cv::Point(16*15,16*15),cv::Point(16*16,16*16),127);
     // cv::imshow("window",im_debug);
     // cv::waitKey(0);
-    cv::imshow("window",im_out);
-    cv::waitKey(0);
+    // cv::imshow("window",im_out);
+    // cv::waitKey(0);
 
 	// cleanup memory
 	cudaFree(d_im_l);
