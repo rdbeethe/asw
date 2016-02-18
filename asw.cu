@@ -98,8 +98,8 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	float costs[MAX_DISP];
 	float min_cost;
 	int min_cost_index;
-	float* ref_center_pix;
-	float* tgt_center_pix;
+	float ref_center_pix[3];
+	float tgt_center_pix[3];
 	float ref_pix[3];
 	float tgt_pix[3];
 
@@ -129,7 +129,6 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	int yblocks = ref_rows / blockDim.y + 1;
 	int xstart = (bx*blockDim.x - win_rad)*NCHANS;
 	int ystart = gy - win_rad;
-	// 29 variables here
 	for(int i = 0; i < xblocks; i++){
 		int x_idx = i*blockDim.x + tx;
 		int g_x_idx = xstart + i*blockDim.x + tx;
@@ -170,13 +169,17 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 
 	__syncthreads();
 
-	// get a pointer to the ref_center_pix, which is constant for any given thread
-	ref_center_pix = &ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS];
+	// store ref_center_pix in register, which is constant for any given thread
+	ref_center_pix[0] = ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS + 0];
+	ref_center_pix[1] = ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS + 1];
+	ref_center_pix[2] = ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS + 2];
 
 	// for each value of ndisp	
 	for(int disp = 0; disp < ndisp; disp++){
-		// get a pointer to the tgt_center_pix, which is constant for each disp
-		tgt_center_pix = &tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS];
+		// store tgt_center_pix in register memory, which is constant for each disp
+		tgt_center_pix[0] = tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS + 0];
+		tgt_center_pix[1] = tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS + 1];
+		tgt_center_pix[2] = tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS + 2];
 		// reset weight and cost
 		weight = 0;
 		cost = 0;
@@ -210,9 +213,6 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				float tgt_c2p_diff = abs(tgt_center_pix[0] - ref_pix[0]);
 				float ref2tgt_diff = abs(ref_pix[0] - tgt_pix[0]);
 				// include additional channels
-				ref_c2p_diff += abs(ref_center_pix[0] - ref_pix[0]);
-				tgt_c2p_diff += abs(tgt_center_pix[0] - ref_pix[0]);
-				ref2tgt_diff+= abs(ref_pix[0] - tgt_pix[0]);
 				ref_c2p_diff += abs(ref_center_pix[1] - ref_pix[1]);
 				tgt_c2p_diff += abs(tgt_center_pix[1] - ref_pix[1]);
 				ref2tgt_diff+= abs(ref_pix[1] - tgt_pix[1]);
@@ -230,7 +230,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				weight += s_factor*ref_c_factor*tgt_c_factor;
 			}
 		}
-		// before moving to a new disp, add the weights and costs into the thing
+		// before moving to a new disp, add the weights and costs into a local memory array
 		costs[disp] += cost;
 		weights[disp] += weight;
 	}
