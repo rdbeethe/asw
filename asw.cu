@@ -93,7 +93,9 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	float s_factor; // I think I can calculate this each time for now
 	// variables for keeping track of the output
 	float weight;
+	float weights[MAX_DISP];
 	float cost;
+	float costs[MAX_DISP];
 	float min_cost;
 	int min_cost_index;
 	float* ref_center_pix;
@@ -109,7 +111,11 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	int gx = bx*blockDim.x + tx;
 	int gy = by*blockDim.y + ty;
 
-	// setup LUTs // nevermind... right now there are none
+	// initialize weights and costs to zero
+	for(int i = 0; i < ndisp; i ++){
+		costs[i]=0;
+		weights[i]=0;
+	}
 
 	// copy relevant subimages to shared memory
 	// TODO: additional boundary checks on this data
@@ -166,10 +172,6 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 
 	// get a pointer to the ref_center_pix, which is constant for any given thread
 	ref_center_pix = &ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS];
-	// initialize min_cost to some arbitrarily large value
-	min_cost = 1e12;
-	// initialize min_cost_index to 0
-	min_cost_index = 0;
 
 	// for each value of ndisp	
 	for(int disp = 0; disp < ndisp; disp++){
@@ -203,7 +205,7 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				tgt_pix[0] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 0];
 				tgt_pix[1] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 1];
 				tgt_pix[2] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 2];
-				// get the center-to-pixel and overall color differences (organized together for IDP)
+				// get the center-to-pixel and overall color differences (organized together for ILP)
 				float ref_c2p_diff = abs(ref_center_pix[0] - ref_pix[0]);
 				float tgt_c2p_diff = abs(tgt_center_pix[0] - ref_pix[0]);
 				float ref2tgt_diff = abs(ref_pix[0] - tgt_pix[0]);
@@ -228,9 +230,20 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 				weight += s_factor*ref_c_factor*tgt_c_factor;
 			}
 		}
-		// now that the window is done, compare this cost (after normalizing) to min_cost
-		if( min_cost > cost / weight){
-			min_cost = cost / weight;
+		// before moving to a new disp, add the weights and costs into the thing
+		costs[disp] += cost;
+		weights[disp] += weight;
+	}
+
+	__syncthreads();
+
+	// now go through and find the lowest normalized cost
+	min_cost_index = 0;
+	min_cost = costs[0]/weights[0];
+	for(int disp = 1; disp < ndisp; disp++){
+		cost = costs[disp]/weights[disp];	
+		if(cost < min_cost){
+			min_cost = cost;
 			min_cost_index = disp;
 		}
 		__syncthreads();
@@ -356,8 +369,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     // cv::rectangle(im_out,cv::Point(16*15,16*15),cv::Point(16*16,16*16),127);
     // cv::imshow("window",im_debug);
     // cv::waitKey(0);
-    // cv::imshow("window",im_out);
-    // cv::waitKey(0);
+    cv::imshow("window",im_out);
+    cv::waitKey(0);
 
 	// cleanup memory
 	cudaFree(d_im_l);
