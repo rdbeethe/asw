@@ -1,5 +1,8 @@
 all:
-	nvcc `pkg-config opencv --cflags` asw.cu `pkg-config opencv --libs`
+	nvcc -g `pkg-config opencv --cflags` asw.cu `pkg-config opencv --libs`
+
+debug:
+	cuda-gdb --args ./a.out l.png r.png 64 5 50
 
 run:
-	optirun ./a.out l.png r.png 64 5 50
+	./a.out l.png r.png 64 5 50 | less

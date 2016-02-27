@@ -8,11 +8,17 @@
 
 #define MAX_BLOCK_SIZE 32
 #define MAX_WINDOW_SIZE 55
-#define MAX_DISP 1000
+#define MAX_DISP 128
 
 #define NCHANS 3
 
-#define BLOCK_SIZE 16
+#define BLOCK_SIZE_X 16
+#define BLOCK_SIZE_Y 8
+#define bdx blockDim.x
+#define bdy blockDim.y
+#define tix threadIdx.x
+#define tiy threadIdx.y
+
 
 // timing utility
 struct timespec check_timer(const char* str, struct timespec* ts){
@@ -40,9 +46,7 @@ struct timespec check_timer(const char* str, struct timespec* ts){
 
 // little bitty kernel to initialize blocks of device memory
 __global__ void gpu_memset(unsigned char* start, unsigned char value, int length){
-	int tx = threadIdx.x;
-	int bx = blockIdx.x;
-	int gx = bx*blockDim.x + tx;
+	int gx = blockIdx.x*bdx + tix;
 	if(gx < length){
 		start[gx] = value;
 	}
@@ -68,25 +72,17 @@ void gpu_perror(char* input){
 __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
 	int nrows, int ncols, int nchans, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
 	{
-	// ok, we're going to try a block size of 32 ( 32x32 = 1024, max threads per block )
-	// no... we'll use 16x16 since there's problems with shared memory with two images
 	// each thread will calculate the full asw stereo output for a single pixel
-	// shared memory will contain all the input image data for the full block of asw calculations
-	// texture memory will contain the spacial filter, eventually
 	extern __shared__ float im[]; // contains both left and right image data
 
 	// get the size of the sub-images that we are considering
 	// reference window
-	int ref_width_pix = 2*win_rad+blockDim.x;
-	// int ref_width_bytes = ref_width_pix*NCHANS;
-	int ref_rows = 2*win_rad+blockDim.y;
+	int ref_width_pix = 2*win_rad+bdx;
 	// target window
-	int tgt_width_pix = ndisp+2*win_rad+blockDim.x;
-	// int tgt_width_bytes = tgt_width_pix*NCHANS;
-	int tgt_rows = 2*win_rad+blockDim.y;
+	int tgt_width_pix = ndisp+2*win_rad+bdx;
 
 	float* ref = im; // left image, reference to the beginnning of im[]
-	float* tgt = (float*)(&im[ ref_width_pix*NCHANS*ref_rows ]); // right image, reference to somwhere in middle of im[]
+	float* tgt = (float*)(&im[ ref_width_pix*NCHANS*2*bdy ]); // right image, reference to somwhere in middle of im[]
 
 	float ref_c_factor;  // this will have to be recalculated every time
 	float tgt_c_factor;  // this will have to be recalculated every time
@@ -102,14 +98,13 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 	float tgt_center_pix[3];
 	float ref_pix[3];
 	float tgt_pix[3];
+	float tgt_centers[3*MAX_DISP];
 
 	// get identity of this thread
-	int tx = threadIdx.x;
-	int ty = threadIdx.y;
 	int bx = blockIdx.x + 5;
 	int by = blockIdx.y + 1;
-	int gx = bx*blockDim.x + tx;
-	int gy = by*blockDim.y + ty;
+	int gx = bx*bdx + tix;
+	int gy = by*bdy + tiy;
 
 	// initialize weights and costs to zero
 	for(int i = 0; i < ndisp; i ++){
@@ -117,125 +112,137 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 		weights[i]=0;
 	}
 
-	// copy relevant subimages to shared memory
-	// TODO: additional boundary checks on this data
-	// TODO: better division technique
-	// TODO: investigate where syncthreads() needs to be called for best performance
-	// we can copy the 24-bit image over 32 bits at a time
-	// except then I don't know how to deal with the edge case
-	// so let's just do one character at a time
-	// starting with reference image:
-	int xblocks = ref_width_pix*NCHANS / blockDim.x + 1;
-	int yblocks = ref_rows / blockDim.y + 1;
-	int xstart = (bx*blockDim.x - win_rad)*NCHANS;
-	int ystart = gy - win_rad;
-	for(int i = 0; i < xblocks; i++){
-		int x_idx = i*blockDim.x + tx;
-		int g_x_idx = xstart + i*blockDim.x + tx;
-		if(x_idx < ref_width_pix*NCHANS){
-			for(int j = 0; j < yblocks; j++){
-				int y_idx = j*blockDim.y + ty;
-				int g_y_idx = ystart + j*blockDim.y;
-				if(y_idx < ref_rows){
-					// copy bytes (not pixels) from global_left into reference image
-					ref[y_idx*ref_width_pix*NCHANS + x_idx] = global_left[g_y_idx*ncols*NCHANS + g_x_idx];
-					// copy into the debug image (only made to work with a single block of threads)
-					// debug[g_y_idx*ncols*NCHANS + g_x_idx]  = ref[y_idx*ref_width_pix*NCHANS + x_idx];
-				}
-			}
-		}
+	// copy center pix for all disparities from global memory to local memory
+	// since there will be a nasty access pattern
+	// TODO: better boundary conditions
+	for(int disp = 0; disp < ndisp; disp++){
+		tgt_centers[3*disp + 0] = global_right[(gy*ncols + gx - disp)*NCHANS + 0]; 
+		tgt_centers[3*disp + 1] = global_right[(gy*ncols + gx - disp)*NCHANS + 1]; 
+		tgt_centers[3*disp + 2] = global_right[(gy*ncols + gx - disp)*NCHANS + 2]; 
 	}
-	// then to the target image:
-	xblocks = tgt_width_pix*NCHANS / blockDim.x + 1;
-	yblocks = tgt_rows / blockDim.y + 1;
-	xstart = (bx*blockDim.x - win_rad - ndisp)*NCHANS;
-	ystart = gy - win_rad;
-	for(int i = 0; i < xblocks; i++){
-		int x_idx = i*blockDim.x + tx;
-		int g_x_idx = xstart + i*blockDim.x + tx;
-		if(x_idx < tgt_width_pix*NCHANS){
-			for(int j = 0; j < yblocks; j++){
-				int y_idx = j*blockDim.y + ty;
-				int g_y_idx = ystart + j*blockDim.y;
-				if(y_idx < tgt_rows){
-					// copy bytes (not pixels) from global_left into reference image
-					tgt[y_idx*tgt_width_pix*NCHANS + x_idx] = global_right[g_y_idx*ncols*NCHANS + g_x_idx];
-					// copy into the debug image (only made to work with a single block of threads)
-					// debug[g_y_idx*ncols*NCHANS + g_x_idx]  = tgt[y_idx*tgt_width_pix*NCHANS + x_idx];
-				}
-			}
-		}
-	}
-
-	__syncthreads();
 
 	// store ref_center_pix in register, which is constant for any given thread
-	ref_center_pix[0] = ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS + 0];
-	ref_center_pix[1] = ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS + 1];
-	ref_center_pix[2] = ref[(win_rad + ty)*ref_width_pix*NCHANS + (win_rad + tx)*NCHANS + 2];
+	ref_center_pix[0] = global_left[gy*ncols*NCHANS + gx + 0];
+	ref_center_pix[1] = global_left[gy*ncols*NCHANS + gx + 1];
+	ref_center_pix[2] = global_left[gy*ncols*NCHANS + gx + 2];
 
-	// for each value of ndisp	
-	for(int disp = 0; disp < ndisp; disp++){
-		// store tgt_center_pix in register memory, which is constant for each disp
-		tgt_center_pix[0] = tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS + 0];
-		tgt_center_pix[1] = tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS + 1];
-		tgt_center_pix[2] = tgt[(win_rad + ty)*tgt_width_pix*NCHANS + (ndisp + win_rad + tx - disp)*NCHANS + 2];
-		// reset weight and cost
-		weight = 0;
-		cost = 0;
-		// in each row in the window:
-		for(int win_x = 0; win_x < win_size; win_x++){
-			// locate the pixel in the ref image (deleted this var)
-			// int dx = win_x + tx;
-			// locate the pixel in the tgt image (deleted this var)
-			// int tgt_x = ndisp + win_x + tx - disp;
-			// find the window-center to pixel x-distance (deleted this var)
-			// int dx = win_x - win_rad;
-			// in each column of the window:
-			for(int win_y = 0; win_y < win_size; win_y++){
-				// locate the pixel in the ref image (deleted this var)
-				// int ref_y = win_y + ty;
-				// find the window-center to pixel y-distance (deleted this var)
-				// int dy = win_y - win_rad;
-				// get the radius^2 value (deleted this var)
-				// float radius_2 = (win_x-win_rad)*(win_x-win_rad) + (win_y-win_rad)*(win_y-win_rad);
-				// get the s_factor for this particular window location
-				s_factor = __expf(-((win_x-win_rad)*(win_x-win_rad) + (win_y-win_rad)*(win_y-win_rad))/(2.*s_sigma*s_sigma));
-				// store tgt and ref pixels in register memory
-				ref_pix[0] = ref[(win_y+ty)*ref_width_pix*NCHANS + (win_x+tx)*NCHANS + 0];
-				ref_pix[1] = ref[(win_y+ty)*ref_width_pix*NCHANS + (win_x+tx)*NCHANS + 1];
-				ref_pix[2] = ref[(win_y+ty)*ref_width_pix*NCHANS + (win_x+tx)*NCHANS + 2];
-				tgt_pix[0] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 0];
-				tgt_pix[1] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 1];
-				tgt_pix[2] = tgt[(win_y+ty)*tgt_width_pix*NCHANS + (ndisp+win_x+tx-disp)*NCHANS + 2];
-				// get the center-to-pixel and overall color differences (organized together for ILP)
-				float ref_c2p_diff = abs(ref_center_pix[0] - ref_pix[0]);
-				float tgt_c2p_diff = abs(tgt_center_pix[0] - ref_pix[0]);
-				float ref2tgt_diff = abs(ref_pix[0] - tgt_pix[0]);
-				// include additional channels
-				ref_c2p_diff += abs(ref_center_pix[1] - ref_pix[1]);
-				tgt_c2p_diff += abs(tgt_center_pix[1] - ref_pix[1]);
-				ref2tgt_diff+= abs(ref_pix[1] - tgt_pix[1]);
-				ref_c2p_diff += abs(ref_center_pix[2] - ref_pix[2]);
-				tgt_c2p_diff += abs(tgt_center_pix[2] - ref_pix[2]);
-				ref2tgt_diff+= abs(ref_pix[2] - tgt_pix[2]);
-				// get the c_factors
-				ref_c_factor = __expf(-ref_c2p_diff*ref_c2p_diff/(2.*c_sigma*c_sigma));
-				tgt_c_factor = __expf(-tgt_c2p_diff*tgt_c2p_diff/(2.*c_sigma*c_sigma));
-				// calulate the pix_weight (this variable has been done away with to increase ILP)
-				// pix_weight = s_factor*ref_c_factor*tgt_c_factor;
-				// add in the cost
-				cost += s_factor*ref_c_factor*tgt_c_factor*ref2tgt_diff;
-				// add in the weight
-				weight += s_factor*ref_c_factor*tgt_c_factor;
+	// first copy from global memory to the first bdy rows of shared memory
+	// in the ref image... :
+	for(int x_block = 0; x_block < (2*win_rad+bdx)/bdx + 1; x_block++){
+		// check if x is greater than the width of the reference image
+		if(x_block*bdx + tix > ref_width_pix*NCHANS){
+			ref[ref_width_pix*NCHANS*tiy + x_block*bdx + tix] = global_left[((gy-win_rad)*ncols+gx-win_rad+x_block*bdx)*NCHANS];
+		}
+	}
+	__syncthreads();
+	// ... and in the tgt image:
+	for(int x_block = 0; x_block < (2*win_rad+bdx+ndisp)/bdx + 1; x_block++){
+		// check if x is greater than the width of the tgt image
+		if(x_block*bdx + tix > tgt_width_pix*NCHANS){
+			tgt[tgt_width_pix*NCHANS*tiy + x_block*bdx + tix] = global_right[((gy-win_rad)*ncols+gx-win_rad-ndisp+x_block*bdx)*NCHANS];
+		}
+	}
+	__syncthreads();
+
+	///////// MAIN LOOP:
+	// for every block copy from global memory
+	for(int y_block = 0; y_block < (2*win_rad+bdy)/(2*bdy)+1; y_block ++){
+		// check to make sure we're in a row that needs to be copied
+		if(y_block*(bdy+1) + tiy < 2*win_rad + bdy){
+			// copy from global memory to the last bdy rows of shared memory 
+			// in the ref image... :
+			for(int x_block = 0; x_block < (2*win_rad+bdx)/bdx + 1; x_block++){
+				ref[ref_width_pix*NCHANS*tiy + x_block*bdx + tix] = global_left[((gy-win_rad+y_block*(bdy+1))*ncols+gx-win_rad+x_block*bdx)*NCHANS];
+			}
+			// ... then in the tgt image:
+			for(int x_block = 0; x_block < (2*win_rad+bdx+ndisp)/bdx + 1; x_block++){
+				tgt[tgt_width_pix*NCHANS*tiy + x_block*bdx + tix] = global_right[((gy-win_rad+y_block*(bdy+1))*ncols+gx-win_rad-ndisp+x_block*bdx)*NCHANS];
 			}
 		}
-		// before moving to a new disp, add the weights and costs into a local memory array
-		costs[disp] += cost;
-		weights[disp] += weight;
+		__syncthreads();
+		// now for up to bdy rows of shared memory:
+		int shared_y = 0;
+		while(true){
+			// check if this is past the last valid row
+			if(y_block*bdy + shared_y == win_size){
+				// TODO: really this should skip the final copy step, just after this loop
+				break;
+			}else if(shared_y > bdy && y_block*bdy + shared_y != win_size-1){ // otherwise, unless it is the very last row...
+				// then completing bdy calculations means its time to move on
+				break;
+			}
+			// for each value of ndisp	
+			for(int disp = 0; disp < ndisp; disp++){
+
+                // TODO: this seems like it's not the right numbers output
+                // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0 && threadIdx.y==0){
+                //     ((int*)debug)[(2+y_block)*ndisp+disp] = shared_y;
+                // }
+                // __syncthreads();
+
+				// store tgt_center_pix in register memory, which is constant for each disp
+				tgt_center_pix[0] = tgt_centers[3*disp + 0];
+				tgt_center_pix[1] = tgt_centers[3*disp + 1];
+				tgt_center_pix[2] = tgt_centers[3*disp + 2];
+				// reset weight and cost
+				weight = 0;
+				cost = 0;
+				// in each column of the window:
+				for(int win_x = 0; win_x < win_size; win_x++){
+					// get the s_factor for this particular window location
+					s_factor = __expf(-((float)(win_x-win_rad)*(win_x-win_rad) + (shared_y+y_block*bdy-win_rad)*(shared_y+y_block*bdy-win_rad))/(2.*s_sigma*s_sigma));
+					// store tgt and ref pixels in register memory
+					ref_pix[0] = ref[(shared_y+tiy)*ref_width_pix*NCHANS + (win_x+tix)*NCHANS + 0];
+					ref_pix[1] = ref[(shared_y+tiy)*ref_width_pix*NCHANS + (win_x+tix)*NCHANS + 1];
+					ref_pix[2] = ref[(shared_y+tiy)*ref_width_pix*NCHANS + (win_x+tix)*NCHANS + 2];
+					tgt_pix[0] = tgt[(shared_y+tiy)*tgt_width_pix*NCHANS + (ndisp+win_x+tix-disp)*NCHANS + 0];
+					tgt_pix[1] = tgt[(shared_y+tiy)*tgt_width_pix*NCHANS + (ndisp+win_x+tix-disp)*NCHANS + 1];
+					tgt_pix[2] = tgt[(shared_y+tiy)*tgt_width_pix*NCHANS + (ndisp+win_x+tix-disp)*NCHANS + 2];
+					// get the center-to-pixel and overall color differences (organized together for ILP)
+					float ref_c2p_diff = abs(ref_center_pix[0] - ref_pix[0]);
+					float tgt_c2p_diff = abs(tgt_center_pix[0] - ref_pix[0]);
+					float ref2tgt_diff = abs(ref_pix[0] - tgt_pix[0]);
+					// include additional channels
+					ref_c2p_diff += abs(ref_center_pix[1] - ref_pix[1]);
+					tgt_c2p_diff += abs(tgt_center_pix[1] - ref_pix[1]);
+					ref2tgt_diff+= abs(ref_pix[1] - tgt_pix[1]);
+					ref_c2p_diff += abs(ref_center_pix[2] - ref_pix[2]);
+					tgt_c2p_diff += abs(tgt_center_pix[2] - ref_pix[2]);
+					ref2tgt_diff+= abs(ref_pix[2] - tgt_pix[2]);
+					// get the c_factors
+					ref_c_factor = __expf(-ref_c2p_diff*ref_c2p_diff/(2.*c_sigma*c_sigma));
+					tgt_c_factor = __expf(-tgt_c2p_diff*tgt_c2p_diff/(2.*c_sigma*c_sigma));
+					// add in the cost
+					cost += s_factor*ref_c_factor*tgt_c_factor*ref2tgt_diff;
+					// add in the weight
+					weight += s_factor*ref_c_factor*tgt_c_factor;
+				}
+				// before moving to a new disp, add the weights and costs into a local memory array
+				costs[disp] += cost;
+				weights[disp] += weight;
+			}
+			// move on to the next row of shared_y
+			shared_y ++;
+		}
+		// copy the bottom half of the shared memory array to the top half
+		// first in the ref image... :
+		for(int x_block = 0; x_block < (2*win_rad+bdx)/bdx + 1; x_block++){
+			// check if x is greater than the width of the reference image
+			if(x_block*bdx + tix > ref_width_pix*NCHANS){
+				ref[ref_width_pix*NCHANS*tiy + x_block*bdx + tix] = ref[ref_width_pix*NCHANS*(tiy+bdy) + x_block*bdx + tix];
+			}
+		}
+		__syncthreads();
+		// ... and in the tgt image:
+		for(int x_block = 0; x_block < (2*win_rad+bdx+ndisp)/bdx + 1; x_block++){
+			// check if x is greater than the width of the tgt image
+			if(x_block*bdx + tix > tgt_width_pix*NCHANS){
+				tgt[tgt_width_pix*NCHANS*tiy + x_block*bdx + tix] = tgt[tgt_width_pix*NCHANS*(tiy+bdy) + x_block*bdx + tix];
+			}
+		}
+		__syncthreads();
 	}
 
-	__syncthreads();
 
 	// now go through and find the lowest normalized cost
 	min_cost_index = 0;
@@ -246,11 +253,17 @@ __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_rig
 			min_cost = cost;
 			min_cost_index = disp;
 		}
-		__syncthreads();
+        // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0 && threadIdx.y==0){
+        //     ((float*)debug)[disp] = costs[disp];
+        //     ((float*)debug)[ndisp+disp] = bdy;
+        //     // ((float*)debug)[disp+ndisp] = weights[disp];
+        // }
+		// __syncthreads();
 	}
 
-	// set the output to the index of min_cost
+	// set the output to min_cost_index
 	output[gy*ncols + gx] = min_cost_index;
+
 }
 
 int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
@@ -299,29 +312,6 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     cudaMemcpy(d_im_l, data_l, nchans*nrows*ncols*sizeof(unsigned char), cudaMemcpyHostToDevice);
     cudaMemcpy(d_im_r, data_r, nchans*nrows*ncols*sizeof(unsigned char), cudaMemcpyHostToDevice);
 
-	// get gaussian kernel for spacial look-up table:
-	// equation from cv::getGaussianKernel(), but without normalization
-	// float s_weights[win_size][win_size]; 
-	// for(int i=0; i<win_size; i++){
-	// 	for(int j=0; j<win_size; j++){
-	// 		float x = i-win_rad;
-	// 		float y = j-win_rad;
-	// 		float radius = sqrt(x*x+y*y);
-	// 		s_weights[i][j] = std::pow(2.71828,-radius*radius/(2.*s_sigma*s_sigma));
-	// 		// printf("%.6f ",s_weights[i][j]);
-	// 	}
-	// 	// printf("\n");
-	// }
-
-	// get gaussian kernel for color look-up table:
-	// equation from cv::getGaussianKernel(), but without normalization
-	// float c_weights[511]; 
-	// for(int i=0; i<511; i++){
-	// 	float radius = i-255;
-	// 	c_weights[i] = std::pow(2.71828,-radius*radius/(2.*c_sigma*c_sigma));
-	// 	// printf("%.6f ",c_weights[i]);
-	// }
-
 	// initialize the outputs (otherwise changes persist between runtimes, hard to debug):
 	int tpb = 1024;
 	int bpg = nrows*ncols*sizeof(unsigned char) / tpb + 1;
@@ -332,8 +322,8 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 	gpu_perror("memset2");
 
 	// check some values before calling the asw_kernel
-	size_t reference_window_size = (2*win_rad+BLOCK_SIZE)*(2*win_rad+BLOCK_SIZE)*sizeof(float)*nchans;
-	size_t target_window_size = (2*win_rad+ndisp+BLOCK_SIZE)*(BLOCK_SIZE+2*win_rad)*sizeof(float)*nchans;
+	size_t reference_window_size = (2*win_rad+BLOCK_SIZE_X)*(2*BLOCK_SIZE_Y)*sizeof(float)*nchans;
+	size_t target_window_size = (2*win_rad+ndisp+BLOCK_SIZE_X)*(2*BLOCK_SIZE_Y)*sizeof(float)*nchans;
 	size_t shared_size = target_window_size+reference_window_size;
 	printf("win_size %d win_rad %d ndisp %d shared size = %d\n",win_size,win_rad,ndisp,shared_size);
 	if(shared_size > 47000){
@@ -343,8 +333,9 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
 
 	{
 		// call the asw_kernel
-		dim3 blocksPerGrid(22,21);
-		dim3 threadsPerBlock(BLOCK_SIZE,BLOCK_SIZE);
+		dim3 blocksPerGrid(21*16/BLOCK_SIZE_X,22*16/BLOCK_SIZE_Y);
+		// dim3 blocksPerGrid(1,1);
+		dim3 threadsPerBlock(BLOCK_SIZE_X,BLOCK_SIZE_Y);
 		// __global__ void asw_kernel(unsigned char* global_left, unsigned char* global_right, unsigned char* output, unsigned char* debug,
 		//		int nrows, int ncols, int nchans, int ndisp, int win_size, int win_rad, float s_sigma, float c_sigma)
 		printf("starting asw kernel\n");
@@ -361,6 +352,7 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     cudaMemcpy(out, d_out, nrows*ncols*sizeof(unsigned char), cudaMemcpyDeviceToHost);
     cudaMemcpy(debug, d_debug, nrows*ncols*nchans*sizeof(unsigned char), cudaMemcpyDeviceToHost);
     check_timer("copying complete",&timer);
+    printf("%d\n",debug[0]);
 
     // make an image and view it:
     cv::Mat im_out(nrows,ncols,CV_8UC1,out);
@@ -369,8 +361,12 @@ int asw(cv::Mat im_l, cv::Mat im_r, int ndisp, int s_sigma, int c_sigma){
     // cv::rectangle(im_out,cv::Point(16*15,16*15),cv::Point(16*16,16*16),127);
     // cv::imshow("window",im_debug);
     // cv::waitKey(0);
-    cv::imshow("window",im_out);
-    cv::waitKey(0);
+    // cv::imshow("window",im_out);
+    // cv::waitKey(0);
+    cv::imwrite("out.png",im_out);
+    // for(int i=0; i<ndisp; i++){
+    //     printf("index:cost:weight for disp %d:%f:%f\n", i, ((float*)debug)[i],((float*)debug)[ndisp+i]);
+    // }
 
 	// cleanup memory
 	cudaFree(d_im_l);
