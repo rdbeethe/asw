@@ -1,4 +1,6 @@
-a.out
 cpu_asw
 out.png
 out_cpu_asw.png
+gpu_asw
+out_gpu_asw.png
+
