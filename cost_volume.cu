@@ -14,6 +14,7 @@
 
 using namespace std;
 using namespace cv;
+using namespace cuda;
 
 struct cost_volume_t get_gpu_volume(struct cost_volume_t vin){
 	struct cost_volume_t vout;
@@ -88,34 +89,39 @@ int main(int argc, char** argv){
 	printf("ndisp,ksize,s_sigma,c_sigma: %d,%d,%.3f,%.3f\n",ndisp,ksize,s_sigma,c_sigma);
 
 	Mat out,out_gpu;
-	//struct cost_volume_t gpu_volume = createCostVolume_gpu(l_im, r_im, 64);
-	struct cost_volume_t gpu_volume = createCostVolume_tadcg_gpu(l_im, r_im, 64,20,90,.9);
-	costVolumeFilter_jointBilateral_gpu(gpu_volume, l_im, ksize, c_sigma, s_sigma);
+	//GpuMat gpumat_volume = createCostVolume_gpu(l_im, r_im, 64);
+	GpuMat gpumat_volume = createCostVolume_tadcg_gpu(l_im, r_im, 64,20,90,.9);
+	//struct cost_volume_t gpu_volume = cost_volume_from_gpumat(gpumat_volume, 64);
+	//costVolumeFilter_jointBilateral_gpu(gpu_volume, l_im, ksize, c_sigma, s_sigma);
 	//costVolumeFilter_guided_gpu(gpu_volume, l_im, ksize, c_sigma);
 	//costVolumeFilter_box_gpu(gpu_volume, ksize);
-	costVolumeMinimize_gpu(gpu_volume, out_gpu);
+	costVolumeMinimize_gpu(gpumat_volume, out_gpu, 64);
 
 	//struct cost_volume_t cpu_volume = get_gpu_volume(gpu_volume);
 	//costVolumeFilter_guided(cpu_volume,l_im,ksize,c_sigma);
 	//costVolumeMinimize(cpu_volume,out_gpu);
 
-	struct cost_volume_t ref_volume = createCostVolume_tadcg(l_im,r_im,64,20,90,.9);
-	//struct cost_volume_t ref_volume2 = createCostVolume(l_im,r_im,64);
-	costVolumeFilter_jointBilateral(ref_volume, l_im, ksize, c_sigma, s_sigma);
+	//Mat refmat_volume = createCostVolume(l_im,r_im,64);
+	Mat refmat_volume = createCostVolume_tadcg(l_im,r_im,64,20,90,.9);
+	struct cost_volume_t ref_volume = cost_volume_from_mat(refmat_volume,64);
+	//costVolumeFilter_jointBilateral(ref_volume, l_im, ksize, c_sigma, s_sigma);
 	//costVolumeBoxFilter(ref_volume,ksize);
 	//costVolumeFilter_guided(ref_volume,l_im,ksize,c_sigma);
-	//costVolumeFilter_guided(ref_volume2,l_im,ksize,c_sigma);
 	costVolumeMinimize(ref_volume, out);
-	//costVolumeMinimize(ref_volume2, out_gpu);
 	//viewSlices(cpu_volume,0,12);
 	//viewSlices(ref_volume,0,10);
-	// costVolumeFilter_box(cpu_volume,ksize);
 	int show = 1;
 	if(show){
 		printf("l_im\n"); imshow("window",l_im); waitKey(0);
 		printf("cpu\n");  imshow("window",out); waitKey(0);
 		printf("gpu\n");  imshow("window",out_gpu); waitKey(0);
 		printf("python\n");  imshow("window",imread("tadcg.png")); waitKey(0);
+	}
+	int write = 1;
+	if(write){
+		imwrite("l_im",l_im);
+		imwrite("out",out);
+		imwrite("out_gpu",out_gpu);
 	}
 }
 

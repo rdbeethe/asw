@@ -5,38 +5,34 @@
 
 using namespace std;
 using namespace cv;
-
-struct two16s {
-	short int a;
-	short int b;
-};
+using namespace cuda;
 
 // Device code
-__global__ void createCostVolume_tadcg_kernel(cuda::PtrStepi ref_global, cuda::PtrStepi tgt_global, struct cost_volume_t vol, cuda::PtrStepi debug, float tc, float tg, float alpha){
+__global__ void createCostVolume_tadcg_kernel(PtrStepi ref_global, PtrStepi tgt_global, PtrStepf vol, int nrows, int ncols, int ndisp, float tc, float tg, float alpha){
 	int gx = blockIdx.x*blockDim.x + threadIdx.x;
 	int gy = blockIdx.y*blockDim.y + threadIdx.y;
 
 	extern __shared__ struct rgba_pixel tgt_data[]; // contains relevant tgt image data
 
 	// set shared row pointer
-	struct rgba_pixel* s_row = (struct rgba_pixel*)((char*)tgt_data + (blockDim.x+vol.ndisp)*threadIdx.y*sizeof(struct rgba_pixel));
+	struct rgba_pixel* s_row = (struct rgba_pixel*)((char*)tgt_data + (blockDim.x+ndisp)*threadIdx.y*sizeof(struct rgba_pixel));
 	
 	{
 		// set global row for data transfer loop
-		struct rgba_pixel* g_row = (struct rgba_pixel*)((char*)tgt_global.data + tgt_global.step*gy);
+		struct rgba_pixel* g_row = (struct rgba_pixel*)(((char*)tgt_global.data) + tgt_global.step*gy);
 
 		// copy target image global memory into shared memory (all threads must participate)
-		for(int i = 0; i < vol.ndisp + blockDim.x; i += blockDim.x){
+		for(int i = 0; i < ndisp + blockDim.x; i += blockDim.x){
 			// check to make sure the actual read lands in 0 <= col < ncols  && row < nrows
-			if(gy < vol.nrows && (gx - vol.ndisp + i) >= 0 && (gx - vol.ndisp + i) < vol.ncols && threadIdx.x + i < vol.ndisp + blockDim.x){
-				s_row[threadIdx.x + i] = g_row[gx - vol.ndisp + i];
+			if(gy < nrows && (gx - ndisp + i) >= 0 && (gx - ndisp + i) < ncols && threadIdx.x + i < ndisp + blockDim.x){
+				s_row[threadIdx.x + i] = g_row[gx - ndisp + i];
 			}
 			__syncthreads();
 		}
 	}
 
 	// now only threads which land in the image participate
-	if(gy < vol.nrows && gx < vol.ncols){
+	if(gy < nrows && gx < ncols){
 		struct rgba_pixel ref0, ref;
 
 		{
@@ -51,36 +47,40 @@ __global__ void createCostVolume_tadcg_kernel(cuda::PtrStepi ref_global, cuda::P
 			// if(gx > 0){
 			// 	ref0 = g_row[gx-1];
 			// }else{
-			// 	((int*)&(ref0))[0] = 0;
+			// 	ref0.r = 0; ref0.g = 0; ref0.b = 0;
 			// }
 		} 
 
 		struct rgba_pixel tgt;
 		struct rgba_pixel tgt0;
-		// if(gx == 100 && gy == 100){
+
+		// debug
+		// int debug_x = 156;
+		// int debug_y = 177;
+		// if(gx == debug_x && gy == debug_y){
 		// 	printf("ref,ref0 = %d,%d,%d %d,%d,%d\n",ref.b,ref.g,ref.r,ref0.b,ref0.g,ref0.r);
 		// }
 
 		// now go through each disparity
-		for(int disp = 0; disp < vol.ndisp; disp ++){
-			float* g_row = (float*)((char*)vol.volume + (disp*vol.nrows+gy)*vol.stride*sizeof(float));
+		for(int disp = 0; disp < ndisp; disp ++){
+			float* g_row = (float*)(((char*)vol.data) + (disp*nrows+gy)*vol.step);
 			float cost;
 			int adc, adg;
 			// check if this disp has a pixel in the tgt image
 			if( gx - disp >= 0){
 				// read tgt pixel from shared memory
-				tgt = s_row[vol.ndisp + threadIdx.x - disp];
+				tgt = s_row[ndisp + threadIdx.x - disp];
 				// tgt0 is for calculating the gradient
-				tgt0 = s_row[vol.ndisp-1 + threadIdx.x - disp];
+				tgt0 = s_row[ndisp-1 + threadIdx.x - disp];
 
-				// this is the CUDA-C way to do this
 				// caluculate absolute difference of color
+				// ...this is the CUDA-C way to do this
 				adc = abs(ref.r - tgt.r) + abs(ref.g - tgt.g) + abs(ref.b - tgt.b);
 				// caluculate absolute difference of gradient
 				adg = abs(ref.r-ref0.r - tgt.r+tgt0.r) + abs(ref.g-ref0.g - tgt.g+tgt0.g) + abs(ref.b-ref0.b - tgt.b+tgt0.b);
 
-				// this is the PTX way to do this
-				// although SIMD assembly instructions show a slight performance improvement, though these instructions are Kepler-specific
+				// ...this is the PTX way to do this
+				// SIMD assembly instructions show a slight performance improvement, though these instructions are Kepler-specific
 				// int C = 0;
 				// int rgrad;
 				// int tgrad;
@@ -95,6 +95,13 @@ __global__ void createCostVolume_tadcg_kernel(cuda::PtrStepi ref_global, cuda::P
 
 				// calculate cost with TAD C+G
 				cost = alpha*min(tc,(float)adc)+(1-alpha)*min(tg,(float)adg);
+
+				// debug
+				// if(gx == debug_x && gy == debug_y){
+				// 	printf("tgt,tgt0 = %d,%d,%d %d,%d,%d\t",tgt.b,tgt.g,tgt.r,tgt0.b,tgt0.g,tgt0.r);
+				// 	printf("disp,cost,adc,adg = %d,%f,%d,%d\n",disp,cost,adc,adg);
+				// }
+
 			}else{
 				// these values of the cost volume don't correspond to two real pixels, so make the cost high
 				cost = 9999;
@@ -102,38 +109,36 @@ __global__ void createCostVolume_tadcg_kernel(cuda::PtrStepi ref_global, cuda::P
 			__syncthreads();
 			// now write the cost to the actual cost_volume
 			g_row[gx] = cost;
-			// if(gx == 100 && gy == 100){
-			// 	printf("tgt,tgt0 = %d,%d,%d %d,%d,%d\t",tgt.b,tgt.g,tgt.r,tgt0.b,tgt0.g,tgt0.r);
-			// 	printf("disp,cost,adc,adg = %d,%f,%f,%f\n",disp,cost,adc,adg);
-			// }
 			__syncthreads();
 		}
 	}
 }
 
 
-struct cost_volume_t createCostVolume_tadcg_gpu(Mat leftim, Mat rightim, int ndisp, float tc, float tg, float alpha){
+GpuMat createCostVolume_tadcg_gpu(Mat leftim, Mat rightim, int ndisp, float tc, float tg, float alpha){
+	// make sure images are the same size
+	if(leftim.cols != rightim.cols || leftim.rows != rightim.rows && leftim.type() == rightim.type()){
+		printf("ERROR: in createCostVolume(), left and right images do not have matching rows and cols and type\n");
+		return GpuMat();
+	}
+	if(leftim.type() != CV_8UC3){
+		printf("ERROR: in createCostVolume(), leftim must have type CV_8UC3 in current implementation\n");
+		return GpuMat();
+	}
 	int nchans = leftim.channels();
 	int nrows = leftim.rows;
 	int ncols = leftim.cols;
-	size_t pitch;
 	// allocate gpu memory for cost volume
-	float* volume_gpu;
-	cudaMallocPitch(&volume_gpu,&pitch,ncols*sizeof(float),ndisp*nrows);
-	int stride = pitch / sizeof(float);
-	// init struct cost_volume_t object
-	struct cost_volume_t cost_volume = {volume_gpu,nrows,ncols,ndisp,stride};
+	GpuMat volume(nrows*ndisp,ncols,CV_32FC1);
 	// convert BGR images to RGBA
 	cvtColor(leftim,leftim,CV_BGR2RGBA);
 	cvtColor(rightim,rightim,CV_BGR2RGBA);
 	// copy left image to to GPU
-	cuda::GpuMat d_im_l;
+	GpuMat d_im_l;
 	d_im_l.upload(leftim);
 	// copy right image to to GPU
-	cuda::GpuMat d_im_r;
+	GpuMat d_im_r;
 	d_im_r.upload(rightim);
-	// debug setup
-	cuda::GpuMat d_debug(Size(ncols,nrows),CV_8UC4);
 
 	// settings for the kernel
 	// should be 32-threads wide to ensure 128-byte block global reads
@@ -143,26 +148,17 @@ struct cost_volume_t createCostVolume_tadcg_gpu(Mat leftim, Mat rightim, int ndi
 	// call the kernel
 	struct timespec timer;
 	check_timer(NULL,&timer);
-    createCostVolume_tadcg_kernel<<<blocksPerGrid, threadsPerBlock, tgt_shared_mem>>>(d_im_l, d_im_r, cost_volume, d_debug, tc,tg,alpha);
+    createCostVolume_tadcg_kernel<<<blocksPerGrid, threadsPerBlock, tgt_shared_mem>>>(d_im_l, d_im_r, volume, nrows,ncols,ndisp, tc,tg,alpha);
 	cudaDeviceSynchronize();
     check_timer("createCostVolume_tadcg_gpu time",&timer);
 	gpu_perror("createCostVolume_tadcg_kernel");
 
-	// copy debug back over
-	Mat debug;
-	//d_debug.download(debug);
-	// imshow("window",leftim); waitKey(0);
-	// imshow("window",debug); waitKey(0);
-	// imshow("window",leftim); waitKey(0);
-
 	// cleanup the temporary image memory
 	d_im_l.release();
 	d_im_r.release();
-	d_debug.release();
 
-	return cost_volume;
+	return volume;
 }
-
 
 struct bgr_pixel {
 	unsigned char b;
@@ -170,33 +166,27 @@ struct bgr_pixel {
 	unsigned char r;
 };
 
-struct cost_volume_t createCostVolume_tadcg(Mat leftim, Mat rightim, int ndisp, float tc, float tg, float alpha){
+Mat createCostVolume_tadcg(Mat leftim, Mat rightim, int ndisp, float tc, float tg, float alpha){
+	// make sure images are the same size
+	if(leftim.cols != rightim.cols || leftim.rows != rightim.rows && leftim.type() == rightim.type()){
+		printf("ERROR: in createCostVolume_tadcg(), left and right images do not have matching rows and cols and type\n");
+		return Mat();
+	}
+	if(leftim.type() != CV_8UC3){
+		printf("ERROR: in createCostVolume_tadcg(), leftim must have type CV_8UC3 in current implementation\n");
+		return Mat();
+	}
 	int nchans = leftim.channels();
 	int nrows = leftim.rows;
 	int ncols = leftim.cols;
-	int stride = ncols;
-	float* volume = (float*)malloc(ncols*nrows*nchans*ndisp*sizeof(float));
-	// init struct cost_volume_t object
-	struct cost_volume_t cost_volume = {volume,nrows,ncols,ndisp,stride};
-
-	// make sure images are the same size
-	if(leftim.cols != rightim.cols || leftim.rows != rightim.rows && leftim.channels() == rightim.channels()){
-		printf("ERROR: left and right images in createCostVolume do not have matching rows and cols and channels\n");
-		return cost_volume;
-	}
+	// initialize the cost_volume Mat
+	Mat volume(nrows*ndisp,ncols,CV_32FC1);
 
 	struct timespec timer;
 	check_timer(NULL,&timer);
 
-	unsigned char* left =  (unsigned char*)leftim.data;
-	unsigned char* right = (unsigned char*)rightim.data;
-
-	// init values to very large numbers
-	// the reason for this is that some regions near volume edges won't be dealt with
-	for( int i = 0; i < ncols*nrows*nchans*ndisp; i++){
-		// arbitrary large number
-		volume[i] = 9999;
-	}
+	struct bgr_pixel* left =  (struct bgr_pixel*)leftim.data;
+	struct bgr_pixel* right = (struct bgr_pixel*)rightim.data;
 
 	// organization will be ndisp images of rows of pixels
 	// iterate over the whole image
@@ -204,48 +194,60 @@ struct cost_volume_t createCostVolume_tadcg(Mat leftim, Mat rightim, int ndisp, 
 		for(int row = 0; row < nrows; row++){
 			struct bgr_pixel ref,ref0, tgt,tgt0;
 			float cost;
-			ref = ((struct bgr_pixel*)(left))[ncols*row + col];
+			ref = left[ncols*row + col];
 			if(col >0){
-				ref0 = ((struct bgr_pixel*)(left))[ncols*row + col - 1];
+				ref0 = left[ncols*row + col - 1];
 			}else{
 				ref0.b = 0;
 				ref0.g = 0;
 				ref0.r = 0;
 			}
-			// if(col == 100 && row == 100){
+
+			// debug
+			// int debug_x = 156;
+			// int debug_y = 177;
+			// if(col == debug_x && row == debug_y){
 			// 	printf("ref,ref0 = %d,%d,%d %d,%d,%d\n",ref.b,ref.g,ref.r,ref0.b,ref0.g,ref0.r);
 			// }
+
 			// iterate over the disparities
-			for(int disp = 0; disp < min(ndisp,col+1); disp++){
-				// get absolute difference of color and of grad
-				float adc = 0;
-				float adg = 0;
-				tgt = ((struct bgr_pixel*)(right))[ncols*row + col-disp];
-				if(col > 0){
-					tgt0 = ((struct bgr_pixel*)(right))[ncols*row + col-disp - 1];
+			for(int disp = 0; disp < ndisp; disp++){
+				if(col - disp >= 0){
+					// get absolute difference of color and of grad
+					float adc = 0;
+					float adg = 0;
+					tgt = right[ncols*row + col-disp];
+					if(col > 0){
+						tgt0 = right[ncols*row + col-disp - 1];
+					}else{
+						tgt0.b = 0;
+						tgt0.g = 0;
+						tgt0.r = 0;
+					}
+
+					// caluculate absolute difference of color
+					adc = abs((int)ref.r - (int)tgt.r) + abs((int)ref.g - (int)tgt.g) + abs((int)ref.b - (int)tgt.b);
+
+					// caluculate absolute difference of gradient
+					adg = abs((int)ref.r-(int)ref0.r - (int)tgt.r+(int)tgt0.r) + abs((int)ref.g-(int)ref0.g - (int)tgt.g+(int)tgt0.g) + abs((int)ref.b-(int)ref0.b - (int)tgt.b+(int)tgt0.b);
+
+					// calculate cost with TAD C+G
+					cost = alpha*min(adc,tc) + (1-alpha)*min(adg,tg);
+
+					// debug
+					// if(col == debug_x && row == debug_y){
+					// 	printf("tgt,tgt0 = %d,%d,%d %d,%d,%d\t",tgt.b,tgt.g,tgt.r,tgt0.b,tgt0.g,tgt0.r);
+					// 	printf("disp,cost,adc,adg = %d,%f,%f,%f\n",disp,cost,adc,adg);
+					// }
+
+					((float*)volume.data)[nrows*ncols*disp + ncols*row + col] = cost;
 				}else{
-					tgt0.b = 0;
-					tgt0.g = 0;
-					tgt0.r = 0;
+					// no pair of valid pixels at this disp, assign an arbitrary large number
+					((float*)volume.data)[nrows*ncols*disp + ncols*row + col] = 9999;
 				}
-
-				// caluculate absolute difference of color
-				adc = abs((int)ref.r - (int)tgt.r) + abs((int)ref.g - (int)tgt.g) + abs((int)ref.b - (int)tgt.b);
-
-				// caluculate absolute difference of gradient
-				adg = abs((int)ref.r-(int)ref0.r - (int)tgt.r+(int)tgt0.r) + abs((int)ref.g-(int)ref0.g - (int)tgt.g+(int)tgt0.g) + abs((int)ref.b-(int)ref0.b - (int)tgt.b+(int)tgt0.b);
-
-				// calculate cost with TAD C+G
-				cost = alpha*min(adc,tc) + (1-alpha)*min(adg,tg);
-
-				// if(col == 100 && row == 100){
-				// 	printf("tgt,tgt0 = %d,%d,%d %d,%d,%d\t",tgt.b,tgt.g,tgt.r,tgt0.b,tgt0.g,tgt0.r);
-				// 	printf("disp,cost,adc,adg = %d,%f,%f,%f\n",disp,cost,adc,adg);
-				// }
-				volume[nrows*ncols*disp + ncols*row + col] = cost;
 			}
 		}
 	}
 	check_timer("createCostVolume_tadcg time",&timer);
-	return cost_volume;
+	return volume;
 }
